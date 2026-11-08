@@ -91,7 +91,7 @@ class MainActivity : Activity() {
         })
 
         val grid = GridView(this).apply {
-            tag = "grid"; numColumns = gi("cols", 4); selector = null
+            tag = "grid"; numColumns = gi("cols", 4)
             verticalSpacing = dp(gi("gap", 4)); setPadding(0, dp(8), 0, 0)
             clipToPadding = false
         }
