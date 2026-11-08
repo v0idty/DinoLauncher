@@ -9,10 +9,11 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: 8.7
-      - run: gradle assembleDebug
+      - name: Download Gradle
+        run: |
+          curl -fL --retry 8 --retry-delay 10 --retry-all-errors -o gradle.zip https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q gradle.zip
+      - run: ./gradle-8.7/bin/gradle assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: launcher-apk
