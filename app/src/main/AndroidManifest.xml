@@ -3,6 +3,7 @@
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
     <application
+        android:icon="@drawable/ic_launcher"
         android:label="Dino Launcher"
         android:theme="@android:style/Theme.Wallpaper.NoTitleBar">
         <activity
