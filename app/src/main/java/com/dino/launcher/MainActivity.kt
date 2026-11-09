@@ -55,8 +55,9 @@ class MainActivity : Activity() {
     var launched = false
     var ovl: View? = null
     var drawerGrid: GridView? = null
-    var deskGrid: GridView? = null
-    var deskArea: View? = null
+    var deskLayer: FrameLayout? = null
+    var cellHint: View? = null
+    var lastHint = -1
     var dockBox: LinearLayout? = null
     var searchBox: EditText? = null
     var dragBar: LinearLayout? = null
@@ -109,10 +110,136 @@ class MainActivity : Activity() {
         setOnClickListener { settings() }
     }
 
+    // ---------- свободное размещение на столе ----------
+    // хранится как "пакет|колонка|строка;пакет|колонка|строка"
+    fun deskMap(): LinkedHashMap<String, IntArray> {
+        val m = LinkedHashMap<String, IntArray>()
+        (p.getString("deskp", "") ?: "").split(";").forEach { s ->
+            val t = s.split("|")
+            if (t.size == 3) {
+                val c = t[1].toIntOrNull(); val r = t[2].toIntOrNull()
+                if (c != null && r != null) m[t[0]] = intArrayOf(c, r)
+            }
+        }
+        return m
+    }
+
+    fun saveDesk(m: Map<String, IntArray>) = p.edit()
+        .putString("deskp", m.entries.joinToString(";") { it.key + "|" + it.value[0] + "|" + it.value[1] }).apply()
+
+    fun migrateDesk() {
+        if (p.contains("deskp")) return
+        val cols = gi("hc", 4)
+        val m = LinkedHashMap<String, IntArray>()
+        lst("desk").forEachIndexed { i, pk -> m[pk] = intArrayOf(i % cols, i / cols) }
+        saveDesk(m)
+    }
+
+    fun fixDesk(): LinkedHashMap<String, IntArray> {
+        val cols = gi("hc", 4); val rows = gi("hr", 5)
+        val m = deskMap()
+        var changed = false
+        if (apps.isNotEmpty()) {
+            val known = apps.map { it.pkg }.toSet()
+            if (m.keys.retainAll(known)) changed = true
+        }
+        val used = HashSet<Int>()
+        val pending = ArrayList<String>()
+        for ((pk, pos) in m) {
+            val ok = pos[0] in 0 until cols && pos[1] in 0 until rows && used.add(pos[1] * cols + pos[0])
+            if (!ok) pending.add(pk)
+        }
+        for (pk in pending) {
+            var k = 0
+            while (k < cols * rows && k in used) k++
+            if (k >= cols * rows) m.remove(pk) else { m[pk] = intArrayOf(k % cols, k / cols); used.add(k) }
+            changed = true
+        }
+        if (changed) saveDesk(m)
+        return m
+    }
+
+    fun freeCell(m: Map<String, IntArray>): IntArray? {
+        val cols = gi("hc", 4); val rows = gi("hr", 5)
+        val used = m.values.map { it[1] * cols + it[0] }.toSet()
+        for (k in 0 until cols * rows) if (k !in used) return intArrayOf(k % cols, k / cols)
+        return null
+    }
+
+    fun deskPlace(pkg: String, c: Int, r: Int): Boolean {
+        val m = fixDesk()
+        val src = m[pkg]
+        val occ = m.entries.firstOrNull { it.key != pkg && it.value[0] == c && it.value[1] == r }
+        if (occ != null) {
+            if (src != null) m[occ.key] = intArrayOf(src[0], src[1])
+            else {
+                val f = freeCell(m)
+                if (f == null) { Toast.makeText(this, "Стол заполнен", Toast.LENGTH_SHORT).show(); return false }
+                m[occ.key] = f
+            }
+        } else if (src == null && freeCell(m) == null) {
+            Toast.makeText(this, "Стол заполнен", Toast.LENGTH_SHORT).show(); return false
+        }
+        m[pkg] = intArrayOf(c, r)
+        saveDesk(m)
+        return true
+    }
+
+    fun removeDesk(pkg: String) {
+        val m = deskMap(); m.remove(pkg); saveDesk(m)
+    }
+
+    fun addDeskAuto(pkg: String) {
+        val m = fixDesk()
+        val f = freeCell(m)
+        if (f == null) { Toast.makeText(this, "Стол заполнен", Toast.LENGTH_SHORT).show(); return }
+        m[pkg] = f; saveDesk(m)
+    }
+
+    fun cellAt(x: Float, y: Float): IntArray? {
+        val dl = deskLayer ?: return null
+        if (dl.width == 0 || !dl.isShown) return null
+        val a = IntArray(2); dl.getLocationInWindow(a)
+        val b = IntArray(2); root.getLocationInWindow(b)
+        val lx = x - (a[0] - b[0]); val ly = y - (a[1] - b[1])
+        if (lx < 0 || ly < 0 || lx > dl.width || ly > dl.height) return null
+        val cols = gi("hc", 4); val rows = gi("hr", 5)
+        return intArrayOf(
+            (lx / (dl.width / cols.toFloat())).toInt().coerceIn(0, cols - 1),
+            (ly / (dl.height / rows.toFloat())).toInt().coerceIn(0, rows - 1)
+        )
+    }
+
+    fun hintCell(cell: IntArray?) {
+        val h = cellHint ?: return
+        val dl = deskLayer
+        if (cell == null || dl == null || dl.width == 0) { h.visibility = View.GONE; lastHint = -1; return }
+        val key = cell[1] * 100 + cell[0]
+        if (key == lastHint && h.visibility == View.VISIBLE) return
+        lastHint = key
+        val cw = dl.width / gi("hc", 4); val ch = dl.height / gi("hr", 5)
+        h.layoutParams = FrameLayout.LayoutParams(cw, ch).apply { leftMargin = cell[0] * cw; topMargin = cell[1] * ch }
+        h.visibility = View.VISIBLE
+    }
+
+    fun layoutDesk() {
+        val dl = deskLayer ?: return
+        if (dl.width == 0) return
+        val cw = dl.width / gi("hc", 4); val ch = dl.height / gi("hr", 5)
+        val m = deskMap()
+        for (i in 0 until dl.childCount) {
+            val v = dl.getChildAt(i)
+            val pk = v.tag as? String ?: continue
+            val pos = m[pk] ?: continue
+            v.layoutParams = FrameLayout.LayoutParams(cw, ch).apply { leftMargin = pos[0] * cw; topMargin = pos[1] * ch }
+        }
+    }
+
     // ---------- жизненный цикл ----------
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         p = getSharedPreferences("cfg", 0)
+        migrateDesk()
         val f = IntentFilter().apply {
             addAction(Intent.ACTION_PACKAGE_ADDED); addAction(Intent.ACTION_PACKAGE_REMOVED)
             addAction(Intent.ACTION_PACKAGE_REPLACED); addDataScheme("package")
@@ -395,17 +522,21 @@ class MainActivity : Activity() {
         top.addView(c, LinearLayout.LayoutParams(0, -2, 1f))
         top.addView(gear(), LinearLayout.LayoutParams(dp(48), dp(48)))
         h.addView(top)
-        if (lst("desk").isEmpty()) {
-            deskGrid = null
-            val t = txt("Пусто. Нажми сюда или перетащи приложения из списка", 15f).apply {
-                gravity = Gravity.CENTER; setOnClickListener { pickDesk() }
-            }
-            deskArea = t
-            h.addView(t, LinearLayout.LayoutParams(-1, 0, 1f))
-        } else {
-            val g = newGrid(gi("hc", 4)); deskGrid = g; deskArea = g
-            h.addView(g, LinearLayout.LayoutParams(-1, 0, 1f))
+        val dl = FrameLayout(this)
+        val hint = View(this).apply { background = pill(withA(ac, 0x44), 20); visibility = View.GONE }
+        dl.addView(hint, FrameLayout.LayoutParams(1, 1))
+        cellHint = hint; deskLayer = dl; lastHint = -1
+        dl.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, orr, ob ->
+            if (r - l != orr - ol || b - t != ob - ot) dl.post { layoutDesk() }
         }
+        val wrap = FrameLayout(this)
+        wrap.addView(dl, FrameLayout.LayoutParams(-1, -1))
+        if (deskMap().isEmpty()) wrap.addView(
+            txt("Пусто. Нажми сюда или перетащи приложения из списка", 15f).apply {
+                gravity = Gravity.CENTER; setOnClickListener { pickDesk() }
+            }, FrameLayout.LayoutParams(-1, -1)
+        )
+        h.addView(wrap, LinearLayout.LayoutParams(-1, 0, 1f))
         if (gb("sdock", true)) {
             val d = LinearLayout(this).apply {
                 gravity = Gravity.CENTER; setPadding(dp(8), dp(8), dp(8), dp(8))
@@ -469,7 +600,15 @@ class MainActivity : Activity() {
 
     fun fill() {
         fillDrawer()
-        deskGrid?.adapter = adapter(lst("desk").mapNotNull { pk -> apps.find { it.pkg == pk } }, "desk")
+        deskLayer?.let { dl ->
+            for (i in dl.childCount - 1 downTo 0) if (dl.getChildAt(i) !== cellHint) dl.removeViewAt(i)
+            for ((pk, _) in fixDesk()) {
+                val a = apps.find { it.pkg == pk } ?: continue
+                val c = newCell(true); c.tag = pk; bind(c, a, "desk")
+                dl.addView(c, FrameLayout.LayoutParams(1, 1))
+            }
+            dl.post { layoutDesk() }
+        }
         dockBox?.apply {
             removeAllViews()
             lst("dockl").mapNotNull { pk -> apps.find { it.pkg == pk } }.forEach { a ->
@@ -574,16 +713,6 @@ class MainActivity : Activity() {
         return box.childCount
     }
 
-    fun idxGrid(g: GridView, x: Float, y: Float): Int {
-        val b = IntArray(2); root.getLocationInWindow(b)
-        for (i in 0 until g.childCount) {
-            val c = g.getChildAt(i); val a = IntArray(2); c.getLocationInWindow(a)
-            val l = a[0] - b[0]; val t = a[1] - b[1]
-            if (x >= l && x <= l + c.width && y >= t && y <= t + c.height) return g.firstVisiblePosition + i
-        }
-        return lst("desk").size
-    }
-
     fun place(k: String, pkg: String, idx: Int, max: Int): Boolean {
         val l = lst(k).toMutableList()
         val old = l.indexOf(pkg)
@@ -608,12 +737,13 @@ class MainActivity : Activity() {
                 if (moved) {
                     val z = zoneAt(e.x, e.y)
                     if (z != hot) { hot = z; paintZones() }
+                    hintCell(if (z < 0 && !hit(dockBox, e.x, e.y)) cellAt(e.x, e.y) else null)
                 }
             }
             DragEvent.ACTION_DROP -> drop(a, e.x, e.y)
             DragEvent.ACTION_DRAG_ENDED -> {
                 dragView?.alpha = 1f; dragBar?.visibility = View.GONE
-                dragApp = null; dragView = null; hot = -1; paintZones()
+                dragApp = null; dragView = null; hot = -1; paintZones(); hintCell(null)
             }
         }
         return true
@@ -626,18 +756,20 @@ class MainActivity : Activity() {
         if (z == 1) { startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:" + a.pkg))); return }
         if (z == 2) {
             if (dragSrc == "drawer") hideApp(a)
-            else { val k = if (dragSrc == "dock") "dockl" else "desk"; put(k, lst(k) - a.pkg); rebuild() }
+            else {
+                if (dragSrc == "dock") put("dockl", lst("dockl") - a.pkg) else removeDesk(a.pkg)
+                rebuild()
+            }
             return
         }
         val db = dockBox
         if (db != null && hit(db, x, y)) {
-            if (place("dockl", a.pkg, idxLinear(db, x), 5) && dragSrc == "desk") put("desk", lst("desk") - a.pkg)
+            if (place("dockl", a.pkg, idxLinear(db, x), 5) && dragSrc == "desk") removeDesk(a.pkg)
             rebuild(); return
         }
-        if (hit(deskArea, x, y)) {
-            val g = deskGrid
-            if (place("desk", a.pkg, if (g != null) idxGrid(g, x, y) else 0, 24) && dragSrc == "dock")
-                put("dockl", lst("dockl") - a.pkg)
+        val cell = cellAt(x, y)
+        if (cell != null && deskPlace(a.pkg, cell[0], cell[1])) {
+            if (dragSrc == "dock") put("dockl", lst("dockl") - a.pkg)
             rebuild()
         }
     }
@@ -657,10 +789,11 @@ class MainActivity : Activity() {
     }
 
     fun menu(a: App) {
+        val onDesk = a.pkg in deskMap()
         val items = arrayOf(
             "Удалить", "Информация о приложении", "Переименовать", "Скрыть",
             if (a.pkg in lst("dockl")) "Убрать из дока" else "В док",
-            if (a.pkg in lst("desk")) "Убрать с главного стола" else "На главный стол"
+            if (onDesk) "Убрать с главного стола" else "На главный стол"
         )
         AlertDialog.Builder(this, DLG).setTitle(label(a)).setItems(items) { _, w ->
             when (w) {
@@ -669,7 +802,7 @@ class MainActivity : Activity() {
                 2 -> rename(a)
                 3 -> hideApp(a)
                 4 -> toggle("dockl", a.pkg, 5)
-                5 -> toggle("desk", a.pkg, 24)
+                5 -> { if (onDesk) removeDesk(a.pkg) else addDeskAuto(a.pkg); rebuild() }
             }
         }.m3()
     }
@@ -686,14 +819,17 @@ class MainActivity : Activity() {
 
     fun pickDesk() {
         val l = apps.sortedBy { label(it).lowercase() }
-        val cur = lst("desk")
+        val cur = deskMap()
         val on = BooleanArray(l.size) { l[it].pkg in cur }
         AlertDialog.Builder(this, DLG).setTitle("Приложения на главном столе")
             .setMultiChoiceItems(l.map { label(it) }.toTypedArray(), on) { _, i, c -> on[i] = c }
             .setPositiveButton("Готово") { _, _ ->
-                val chosen = l.filterIndexed { i, _ -> on[i] }.map { it.pkg }
-                put("desk", (cur.filter { it in chosen } + chosen.filter { it !in cur }).take(24))
-                rebuild()
+                val m = fixDesk()
+                l.forEachIndexed { i, a ->
+                    if (!on[i]) m.remove(a.pkg)
+                    else if (a.pkg !in m) { val f = freeCell(m); if (f != null) m[a.pkg] = f }
+                }
+                saveDesk(m); rebuild()
             }.setNegativeButton("Отмена", null).m3()
     }
 
@@ -771,6 +907,7 @@ class MainActivity : Activity() {
         l.sw("Часы и дата", "clock", true)
         l.seek("Размер часов", "cs", 24, 96, 64)
         l.seek("Колонок на столе", "hc", 3, 7, 4)
+        l.seek("Строк на столе", "hr", 3, 8, 5)
         l.sw("Док", "sdock", true)
         l.sw("Подписи в доке", "dlbl", false)
         l.seek("Скругление дока", "dockr", 0, 50, 32)
@@ -795,7 +932,7 @@ class MainActivity : Activity() {
         l.sw("Анимации", "an", true)
         l.color("Акцентный цвет", "ac", cAcc)
         l.btn("Показать скрытые приложения") { p.edit().remove("hidden").apply(); reload() }
-        l.btn("Сбросить всё") { p.edit().clear().apply(); wallMode = -1; reload() }
+        l.btn("Сбросить всё") { p.edit().clear().apply(); wallMode = -1; migrateDesk(); reload() }
         AlertDialog.Builder(this, DLG).setTitle("Настройки")
             .setView(ScrollView(this).apply { addView(l) })
             .setPositiveButton("Готово", null).m3()
