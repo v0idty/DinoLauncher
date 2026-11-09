@@ -31,10 +31,14 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
-    class App(val pkg: String, val orig: String, val raw: Drawable) { var bmp: Bitmap? = null }
+    class App(val pkg: String, val orig: String) {
+        var raw: Drawable? = null
+        var bmp: Bitmap? = null
+    }
 
     lateinit var p: SharedPreferences
     lateinit var root: FrameLayout
@@ -71,6 +75,7 @@ class MainActivity : Activity() {
     var hot = -1
     val ui = Handler(Looper.getMainLooper())
     val pool = Executors.newSingleThreadExecutor()
+    val workers = Executors.newFixedThreadPool(4)
     val DLG = android.R.style.Theme_DeviceDefault_Dialog_Alert
     val applyRun = Runnable { if (needBake) { needBake = false; rebake() } else rebuild() }
     val rcv = object : BroadcastReceiver() {
@@ -265,6 +270,7 @@ class MainActivity : Activity() {
         super.onDestroy()
         ui.removeCallbacksAndMessages(null)
         pool.shutdown()
+        workers.shutdown()
         try { unregisterReceiver(rcv) } catch (e: Exception) {}
     }
 
@@ -373,7 +379,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- данные и иконки ----------
+    // ---------- данные, иконки и кэш ----------
     fun icon(ri: ResolveInfo): Drawable {
         if (gb("oi", true)) try {
             val ai = ri.activityInfo
@@ -409,25 +415,86 @@ class MainActivity : Activity() {
         return out
     }
 
+    fun cacheKey() = "${dp(gi("is", 60))}|${gi("rad", 24)}|${gb("mono", false)}|${gb("oi", true)}|$cSecC|$cOnSecC"
+
+    fun sig(l: List<App>) = l.sortedBy { it.pkg }.joinToString("|") { it.pkg + "=" + it.orig }
+
+    fun readCache(): List<App>? {
+        try {
+            val dir = File(cacheDir, "ic")
+            val idx = File(dir, "index.txt")
+            if (!idx.exists()) return null
+            val lines = idx.readLines()
+            if (lines.isEmpty() || lines[0] != cacheKey()) return null
+            val hidden = p.getStringSet("hidden", emptySet())!!
+            val out = ArrayList<App>()
+            for (ln in lines.drop(1)) {
+                val t = ln.split("\t")
+                if (t.size < 2 || t[0] in hidden) continue
+                val b = BitmapFactory.decodeFile(File(dir, t[0] + ".png").path) ?: continue
+                out.add(App(t[0], t[1]).also { it.bmp = b })
+            }
+            return if (out.isEmpty()) null else out
+        } catch (e: Exception) { return null }
+    }
+
+    fun writeCache(list: List<App>) {
+        try {
+            val dir = File(cacheDir, "ic"); dir.mkdirs()
+            list.forEach { a ->
+                a.bmp?.let { b -> FileOutputStream(File(dir, a.pkg + ".png")).use { b.compress(Bitmap.CompressFormat.PNG, 100, it) } }
+            }
+            File(dir, "index.txt").writeText(
+                cacheKey() + "\n" + list.joinToString("\n") { it.pkg + "\t" + it.orig.replace("\t", " ").replace("\n", " ") }
+            )
+        } catch (e: Exception) {}
+    }
+
     fun reload() {
         pool.execute {
+            val cached = if (apps.isEmpty()) readCache() else null
+            if (cached != null) ui.post { if (apps.isEmpty()) { apps = cached; defaults(); rebuild() } }
             val pm = packageManager
             val hidden = p.getStringSet("hidden", emptySet())!!
-            val list = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+            val ris = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
                 .distinctBy { it.activityInfo.packageName }
                 .filter { it.activityInfo.packageName !in hidden }
-                .map { App(it.activityInfo.packageName, it.loadLabel(pm).toString(), icon(it)) }
+            val list = ris.map { App(it.activityInfo.packageName, it.loadLabel(pm).toString()) }
             val s = dp(gi("is", 60)); val r = gi("rad", 24)
-            list.forEach { it.bmp = bake(it.raw, s, r) }
-            ui.post { apps = list; defaults(); rebuild() }
+            val latch = CountDownLatch(list.size)
+            list.forEachIndexed { i, a ->
+                workers.execute {
+                    try { val d = icon(ris[i]); a.raw = d; a.bmp = bake(d, s, r) }
+                    catch (e: Exception) {}
+                    finally { latch.countDown() }
+                }
+            }
+            latch.await()
+            val same = cached != null && sig(cached) == sig(list)
+            ui.post {
+                apps = list
+                if (!same) { defaults(); rebuild() }
+            }
+            if (!same) writeCache(list)
         }
     }
 
     fun rebake() {
-        val cur = apps; val s = dp(gi("is", 60)); val r = gi("rad", 24)
+        val cur = apps
+        if (cur.any { it.raw == null }) { reload(); return }
+        val s = dp(gi("is", 60)); val r = gi("rad", 24)
         pool.execute {
-            cur.forEach { it.bmp = bake(it.raw, s, r) }
+            val latch = CountDownLatch(cur.size)
+            cur.forEach { a ->
+                workers.execute {
+                    try { a.raw?.let { a.bmp = bake(it, s, r) } }
+                    catch (e: Exception) {}
+                    finally { latch.countDown() }
+                }
+            }
+            latch.await()
             ui.post { rebuild() }
+            writeCache(cur)
         }
     }
 
