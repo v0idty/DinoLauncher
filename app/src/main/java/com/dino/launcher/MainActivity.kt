@@ -20,6 +20,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.Settings
 import android.text.Editable
@@ -39,6 +40,74 @@ class MainActivity : Activity() {
     class App(val pkg: String, val orig: String) {
         var raw: Drawable? = null
         var bmp: Bitmap? = null
+    }
+
+    // векторные иконки (сетка 24x24, как в Material Symbols), рисуются кодом
+    class Ico(var k: Int, var col: Int, val size: Int) : Drawable() {
+        val pt = Paint(Paint.ANTI_ALIAS_FLAG)
+        override fun getIntrinsicWidth() = size
+        override fun getIntrinsicHeight() = size
+        override fun draw(c: Canvas) {
+            val b = bounds
+            val s = minOf(b.width(), b.height()) / 24f
+            c.save(); c.translate(b.left.toFloat(), b.top.toFloat()); c.scale(s, s)
+            pt.style = Paint.Style.STROKE; pt.strokeCap = Paint.Cap.ROUND; pt.strokeJoin = Paint.Join.ROUND
+            pt.strokeWidth = 2f; pt.color = col
+            when (k) {
+                0 -> { // настройки
+                    val g = Path()
+                    val pts = doubleArrayOf(7.0, -18.0, 9.6, -10.0, 9.6, 10.0, 7.0, 18.0)
+                    for (i in 0 until 8) {
+                        for (j in 0 until 4) {
+                            val a = Math.toRadians(i * 45.0 + pts[j * 2 + 1])
+                            val x = (12 + pts[j * 2] * Math.cos(a)).toFloat()
+                            val y = (12 + pts[j * 2] * Math.sin(a)).toFloat()
+                            if (i == 0 && j == 0) g.moveTo(x, y) else g.lineTo(x, y)
+                        }
+                    }
+                    g.close(); c.drawPath(g, pt); c.drawCircle(12f, 12f, 3f, pt)
+                }
+                1 -> { // инфо
+                    c.drawCircle(12f, 12f, 9.5f, pt); c.drawLine(12f, 11f, 12f, 17f, pt)
+                    pt.style = Paint.Style.FILL; c.drawCircle(12f, 7.6f, 1.25f, pt); pt.style = Paint.Style.STROKE
+                }
+                2 -> { // корзина
+                    c.drawLine(4.5f, 7f, 19.5f, 7f, pt)
+                    val h = Path(); h.moveTo(9.5f, 7f); h.lineTo(9.5f, 4.5f); h.lineTo(14.5f, 4.5f); h.lineTo(14.5f, 7f)
+                    c.drawPath(h, pt)
+                    val bd = Path(); bd.moveTo(6.5f, 7f); bd.lineTo(7.5f, 19.5f); bd.lineTo(16.5f, 19.5f); bd.lineTo(17.5f, 7f)
+                    c.drawPath(bd, pt)
+                    c.drawLine(10.2f, 11f, 10.2f, 16f, pt); c.drawLine(13.8f, 11f, 13.8f, 16f, pt)
+                }
+                3 -> { // крестик
+                    c.drawLine(6f, 6f, 18f, 18f, pt); c.drawLine(18f, 6f, 6f, 18f, pt)
+                }
+                4 -> { // скрыть (глаз с чертой)
+                    val e = Path(); e.moveTo(2.5f, 12f); e.quadTo(12f, 2.5f, 21.5f, 12f); e.quadTo(12f, 21.5f, 2.5f, 12f)
+                    c.drawPath(e, pt); c.drawCircle(12f, 12f, 3f, pt); c.drawLine(4.5f, 19.5f, 19.5f, 4.5f, pt)
+                }
+                5 -> { // поиск
+                    c.drawCircle(10.5f, 10.5f, 6.5f, pt); c.drawLine(15.3f, 15.3f, 20f, 20f, pt)
+                }
+                6 -> { // стрелка вверх
+                    val pa = Path(); pa.moveTo(6f, 15f); pa.lineTo(12f, 9f); pa.lineTo(18f, 15f); c.drawPath(pa, pt)
+                }
+                9 -> { // стрелка вниз
+                    val pa = Path(); pa.moveTo(6f, 9f); pa.lineTo(12f, 15f); pa.lineTo(18f, 9f); c.drawPath(pa, pt)
+                }
+                7, 8 -> { // замок закрытый / открытый
+                    c.drawRoundRect(RectF(5f, 11f, 19f, 21f), 2.5f, 2.5f, pt)
+                    val sh = Path(); sh.moveTo(8f, 11f); sh.lineTo(8f, 8f); sh.arcTo(RectF(8f, 4f, 16f, 12f), 180f, 180f)
+                    if (k == 7) sh.lineTo(16f, 11f) else sh.lineTo(16f, 7f)
+                    c.drawPath(sh, pt)
+                    pt.style = Paint.Style.FILL; c.drawCircle(12f, 15.5f, 1.4f, pt); pt.style = Paint.Style.STROKE
+                }
+            }
+            c.restore()
+        }
+        override fun setAlpha(a: Int) { pt.alpha = a }
+        override fun setColorFilter(f: ColorFilter?) { pt.colorFilter = f }
+        override fun getOpacity() = PixelFormat.TRANSLUCENT
     }
 
     lateinit var p: SharedPreferences
@@ -73,7 +142,9 @@ class MainActivity : Activity() {
     var dockBox: LinearLayout? = null
     var searchBox: EditText? = null
     var dragBar: LinearLayout? = null
-    val zones = mutableListOf<TextView>()
+    val zones = mutableListOf<LinearLayout>()
+    val zIcons = mutableListOf<Ico>()
+    val zTexts = mutableListOf<TextView>()
     var dragApp: App? = null
     var dragSrc = ""
     var dragView: View? = null
@@ -83,6 +154,14 @@ class MainActivity : Activity() {
     var hot = -1
     var edgeDir = 0
     var edgeRun: Runnable? = null
+    var lockView: FrameLayout? = null
+    var lockOn = false
+    var lockPending = false
+    var resumed = false
+    var ly0 = 0f
+    var padIco: Ico? = null
+    var bob: ValueAnimator? = null
+    var sDlg: AlertDialog? = null
     val ui = Handler(Looper.getMainLooper())
     val pool = Executors.newSingleThreadExecutor()
     val workers = Executors.newFixedThreadPool(4)
@@ -90,6 +169,9 @@ class MainActivity : Activity() {
     val applyRun = Runnable { if (needBake) { needBake = false; rebake() } else rebuild() }
     val rcv = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) { reload() }
+    }
+    val scr = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) { if (resumed) lockPending = true }
     }
 
     // ---------- цвета Material You ----------
@@ -134,8 +216,10 @@ class MainActivity : Activity() {
         }
     }
 
-    fun gear() = txt("⚙", 22f).apply {
-        gravity = Gravity.CENTER; setTextColor(cOnSecC); background = ripple(withA(cSecC, 0xCC), 26)
+    fun gear() = ImageView(this).apply {
+        setImageDrawable(Ico(0, cOnSecC, dp(24)))
+        setPadding(dp(12), dp(12), dp(12), dp(12))
+        background = ripple(withA(cSecC, 0xCC), 26)
         setOnClickListener {
             if (gb("an", true)) fx(420).rotationBy(180f).start()
             settings()
@@ -428,6 +512,104 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- экран блокировки ----------
+    fun showLock() {
+        if (lockOn) return
+        lockOn = true
+        val lv = FrameLayout(this)
+        lv.setBackgroundColor(gi("wc", cSurf))
+        val wd = wallpaper()?.constantState?.newDrawable()
+        if (wd != null) lv.addView(ImageView(this).apply {
+            setImageDrawable(wd); scaleType = ImageView.ScaleType.CENTER_CROP
+        }, FrameLayout.LayoutParams(-1, -1))
+        lv.addView(View(this).apply { setBackgroundColor(withA(Color.BLACK, 0x70)) }, FrameLayout.LayoutParams(-1, -1))
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(24), dp(96), dp(24), dp(40))
+        }
+        val ico = Ico(7, cOnSecC, dp(28)); padIco = ico
+        col.addView(ImageView(this).apply {
+            setImageDrawable(ico); setPadding(dp(22), dp(22), dp(22), dp(22)); background = pill(withA(cSecC, 0xCC), 36)
+        }, LinearLayout.LayoutParams(dp(72), dp(72)))
+        col.addView(TextClock(this).apply {
+            format24Hour = "HH:mm"; format12Hour = "HH:mm"; textSize = 92f; setTextColor(Color.WHITE)
+            typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+        }, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(28) })
+        col.addView(TextClock(this).apply {
+            format24Hour = "EEEE, d MMMM"; format12Hour = "EEEE, d MMMM"; textSize = 18f; setTextColor(Color.WHITE)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        })
+        col.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
+        val hint = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
+        hint.addView(ImageView(this).apply { setImageDrawable(Ico(6, withA(Color.WHITE, 0xDD), dp(28))) },
+            LinearLayout.LayoutParams(dp(28), dp(28)))
+        hint.addView(TextView(this).apply {
+            text = "Смахни вверх, чтобы открыть"; setTextColor(withA(Color.WHITE, 0xDD)); textSize = 14f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        })
+        col.addView(hint)
+        lv.addView(col, FrameLayout.LayoutParams(-1, -1))
+        root.addView(lv, FrameLayout.LayoutParams(-1, -1))
+        lockView = lv
+        if (gb("an", true)) {
+            lv.alpha = 0f; lv.fx(320).alpha(1f).start()
+            bob?.cancel()
+            bob = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 1100L; repeatCount = ValueAnimator.INFINITE; repeatMode = ValueAnimator.REVERSE
+                addUpdateListener { hint.translationY = -dp(10) * (it.animatedValue as Float) }
+                start()
+            }
+        }
+    }
+
+    fun lockTouch(ev: MotionEvent): Boolean {
+        val lv = lockView ?: return true
+        val h = resources.displayMetrics.heightPixels.toFloat()
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                ly0 = ev.y
+                vt?.recycle(); vt = VelocityTracker.obtain(); vt?.addMovement(ev)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                vt?.addMovement(ev)
+                val dy = minOf(0f, ev.y - ly0)
+                lv.translationY = dy
+                lv.alpha = 1f - 0.7f * (-dy / h)
+                val want = if (-dy > dp(90)) 8 else 7
+                padIco?.let { if (it.k != want) { it.k = want; it.invalidateSelf() } }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                vt?.addMovement(ev); vt?.computeCurrentVelocity(1000)
+                val vy = vt?.yVelocity ?: 0f
+                vt?.recycle(); vt = null
+                val dy = ev.y - ly0
+                if (-dy > dp(150) || vy < -1000f) unlock()
+                else {
+                    padIco?.let { it.k = 7; it.invalidateSelf() }
+                    lv.fx(300, OvershootInterpolator(1.6f)).translationY(0f).alpha(1f).start()
+                }
+            }
+        }
+        return true
+    }
+
+    fun unlock() {
+        val lv = lockView ?: return
+        lockOn = false
+        bob?.cancel(); bob = null
+        padIco?.let { it.k = 8; it.invalidateSelf() }
+        lv.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        val done = Runnable {
+            (lv.parent as? ViewGroup)?.removeView(lv)
+            if (lockView === lv) lockView = null
+            if (prog <= 0.5f) popAll(0L)
+        }
+        if (gb("an", true)) {
+            val h = resources.displayMetrics.heightPixels.toFloat()
+            lv.fx(340, DecelerateInterpolator(1.8f)).translationY(-h).alpha(0f).withEndAction(done).start()
+        } else done.run()
+    }
+
     // ---------- жизненный цикл ----------
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -437,15 +619,33 @@ class MainActivity : Activity() {
             addAction(Intent.ACTION_PACKAGE_ADDED); addAction(Intent.ACTION_PACKAGE_REMOVED)
             addAction(Intent.ACTION_PACKAGE_REPLACED); addDataScheme("package")
         }
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(rcv, f, Context.RECEIVER_EXPORTED)
-        else registerReceiver(rcv, f)
+        val f2 = IntentFilter(Intent.ACTION_SCREEN_OFF)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(rcv, f, Context.RECEIVER_EXPORTED)
+            registerReceiver(scr, f2, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(rcv, f)
+            registerReceiver(scr, f2)
+        }
         rebuild(); reload()
     }
 
     override fun onResume() {
         super.onResume()
+        resumed = true
         ovl?.let { root.removeView(it) }; ovl = null
+        if (lockPending) {
+            lockPending = false
+            if (gb("lock", true) && !lockOn) showLock()
+        }
         if (launched) { launched = false; returnAnim() }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        resumed = false
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!pm.isInteractive) lockPending = true
     }
 
     override fun onDestroy() {
@@ -454,20 +654,24 @@ class MainActivity : Activity() {
         pool.shutdown()
         workers.shutdown()
         try { unregisterReceiver(rcv) } catch (e: Exception) {}
+        try { unregisterReceiver(scr) } catch (e: Exception) {}
     }
 
     override fun onNewIntent(i: Intent?) {
         super.onNewIntent(i)
+        if (lockOn) return
         if (prog > 0f) go(false)
         else pager?.snap(0)
     }
 
     override fun onBackPressed() {
+        if (lockOn) { unlock(); return }
         if (prog > 0.5f) go(false)
     }
 
     // ---------- жесты: список едет за пальцем ----------
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (lockOn) return lockTouch(ev)
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 x0 = ev.x; y0 = ev.y; drag = false
@@ -737,18 +941,24 @@ class MainActivity : Activity() {
         val d = LinearLayout(this); buildDrawer(d); drw = d
         fr.addView(d, FrameLayout.LayoutParams(-1, -1))
         val bar = LinearLayout(this).apply { gravity = Gravity.CENTER; visibility = View.GONE; setPadding(dp(12), dp(36), dp(12), dp(8)) }
-        zones.clear()
-        for (n in listOf("ℹ  Инфо", "🗑  Удалить", "✕  Убрать")) {
-            val z = TextView(this).apply {
-                text = n; textSize = 14f; gravity = Gravity.CENTER; setPadding(dp(8), dp(14), dp(8), dp(14))
-            }
-            zones.add(z)
+        zones.clear(); zIcons.clear(); zTexts.clear()
+        val zt = listOf("Инфо", "Удалить", "Убрать")
+        for (n in 0 until 3) {
+            val ic = Ico(n + 1, cOnSecC, dp(20))
+            val tv = TextView(this).apply { text = zt[n]; textSize = 14f; setPadding(dp(6), 0, 0, 0) }
+            val z = LinearLayout(this).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(14), dp(8), dp(14)) }
+            z.addView(ImageView(this).apply { setImageDrawable(ic) }, LinearLayout.LayoutParams(dp(20), dp(20)))
+            z.addView(tv, LinearLayout.LayoutParams(-2, -2))
+            zIcons.add(ic); zTexts.add(tv); zones.add(z)
             bar.addView(z, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(4), 0, dp(4), 0) })
         }
         dragBar = bar
         paintZones()
         fr.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
         fr.setOnDragListener { _, e -> onDrag(e) }
+        lockView?.let { lv ->
+            if (lockOn) { (lv.parent as? ViewGroup)?.removeView(lv); fr.addView(lv, FrameLayout.LayoutParams(-1, -1)) }
+        }
         root = fr
         setContentView(fr)
         setP(prog)
@@ -840,9 +1050,11 @@ class MainActivity : Activity() {
         searchBox = null
         if (gb("search", true)) {
             val e = EditText(this).apply {
-                hint = "🔍  Поиск приложений"; setHintTextColor(withA(cVar, 0xCC)); setTextColor(cOnSurf)
+                hint = "Поиск приложений"; setHintTextColor(withA(cVar, 0xCC)); setTextColor(cOnSurf)
                 setSingleLine(); textSize = 16f
                 background = pill(gi("pc", withA(cSurfC, 0xE6)), 26)
+                setCompoundDrawablesRelativeWithIntrinsicBounds(Ico(5, withA(cVar, 0xCC), dp(20)), null, null, null)
+                compoundDrawablePadding = dp(10)
                 setPadding(dp(20), 0, dp(20), 0); setText(query); setSelection(query.length)
                 addTextChangedListener(object : TextWatcher {
                     override fun afterTextChanged(s: Editable?) {
@@ -968,7 +1180,9 @@ class MainActivity : Activity() {
     // ---------- перетаскивание ----------
     fun startDrag(v: View, a: App, src: String) {
         dragApp = a; dragSrc = src; dragView = v; moved = false; hot = -1
-        zones[2].text = if (src == "drawer") "🙈  Скрыть" else "✕  Убрать"
+        zTexts[2].text = if (src == "drawer") "Скрыть" else "Убрать"
+        zIcons[2].k = if (src == "drawer") 4 else 3
+        zIcons[2].invalidateSelf()
         v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
         v.startDragAndDrop(ClipData.newPlainText("app", a.pkg), View.DragShadowBuilder(v), null, 0)
         v.alpha = 0.3f
@@ -976,9 +1190,12 @@ class MainActivity : Activity() {
 
     fun paintZones() {
         zones.forEachIndexed { i, z ->
-            z.background = pill(if (i == hot) ac else cSecC, 24)
-            z.setTextColor(if (i == hot) cOnAcc else cOnSecC)
-            val sc = if (i == hot) 1.08f else 1f
+            val on = i == hot
+            z.background = pill(if (on) ac else cSecC, 24)
+            zTexts[i].setTextColor(if (on) cOnAcc else cOnSecC)
+            zIcons[i].col = if (on) cOnAcc else cOnSecC
+            zIcons[i].invalidateSelf()
+            val sc = if (on) 1.08f else 1f
             z.fx(140, OvershootInterpolator(2f)).scaleX(sc).scaleY(sc).start()
         }
     }
@@ -1247,6 +1464,9 @@ class MainActivity : Activity() {
         c.seek("Строк на столе", "hr", 3, 8, 5)
         c.sw("Часы и дата", "clock", true)
         c.seek("Размер часов", "cs", 24, 96, 64)
+        c = l.card("БЛОКИРОВКА")
+        c.sw("Экран блокировки Dino", "lock", true)
+        c.btn("Показать экран блокировки") { sDlg?.dismiss(); showLock() }
         c = l.card("ДОК")
         c.sw("Показывать док", "sdock", true)
         c.sw("Подписи в доке", "dlbl", false)
@@ -1273,7 +1493,7 @@ class MainActivity : Activity() {
         c.color("Акцентный цвет", "ac", cAcc)
         c.btn("Показать скрытые приложения") { p.edit().remove("hidden").apply(); reload() }
         c.btn("Сбросить всё") { p.edit().clear().apply(); wallMode = -1; migrateDesk(); reload() }
-        AlertDialog.Builder(this, DLG).setTitle("Настройки")
+        sDlg = AlertDialog.Builder(this, DLG).setTitle("Настройки")
             .setView(ScrollView(this).apply { addView(l) })
             .setPositiveButton("Готово", null).m3()
         if (gb("an", true)) for (i in 0 until minOf(l.childCount, 12)) {
