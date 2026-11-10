@@ -27,6 +27,7 @@ import android.text.TextUtils
 import android.text.TextWatcher
 import android.view.*
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import java.io.File
@@ -55,11 +56,18 @@ class MainActivity : Activity() {
     var anim: ValueAnimator? = null
     var wall: Drawable? = null
     var wallMode = -1
+    var wallView: ImageView? = null
     var needBake = false
     var launched = false
+    var introPending = true
+    var popPkg: String? = null
     var ovl: View? = null
+    var pager: Pager? = null
+    val pages = mutableListOf<FrameLayout>()
+    var curPage = 0
+    var clockBox: LinearLayout? = null
+    var dotsBox: LinearLayout? = null
     var drawerGrid: GridView? = null
-    var deskLayer: FrameLayout? = null
     var cellHint: View? = null
     var lastHint = -1
     var dockBox: LinearLayout? = null
@@ -73,6 +81,8 @@ class MainActivity : Activity() {
     var sx = 0f
     var sy = 0f
     var hot = -1
+    var edgeDir = 0
+    var edgeRun: Runnable? = null
     val ui = Handler(Looper.getMainLooper())
     val pool = Executors.newSingleThreadExecutor()
     val workers = Executors.newFixedThreadPool(4)
@@ -97,6 +107,7 @@ class MainActivity : Activity() {
     fun gi(k: String, d: Int) = p.getInt(k, d)
     fun gb(k: String, d: Boolean) = p.getBoolean(k, d)
     fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    fun np() = gi("np", 2).coerceIn(1, 6)
     fun label(a: App) = p.getString("n_" + a.pkg, null) ?: a.orig
     fun lst(k: String): List<String> = (p.getString(k, "") ?: "").split(",").filter { it.isNotEmpty() }
     fun put(k: String, l: List<String>) = p.edit().putString(k, l.joinToString(",")).apply()
@@ -107,41 +118,60 @@ class MainActivity : Activity() {
         text = t; textSize = s; setTextColor(tc); setPadding(dp(10), dp(4), dp(10), dp(4))
     }
     fun pill(c: Int, r: Int) = GradientDrawable().apply { setColor(c); cornerRadius = dp(r).toFloat() }
-    fun AlertDialog.Builder.m3(): AlertDialog = create().also {
-        it.show(); it.window?.setBackgroundDrawable(pill(cSurf, 28))
-    }
-    fun gear() = txt("⚙", 22f).apply {
-        gravity = Gravity.CENTER; setTextColor(cOnSecC); background = pill(withA(cSecC, 0xCC), 26)
-        setOnClickListener { settings() }
+    fun ripple(fill: Int, r: Int): Drawable =
+        RippleDrawable(ColorStateList.valueOf(withA(cOnSecC, 0x55)), pill(fill, r), pill(Color.WHITE, r))
+
+    // анимация с явным сбросом задержки и интерполятора
+    fun View.fx(dur: Long, ip: android.view.animation.Interpolator = DecelerateInterpolator(2f), delay: Long = 0L): ViewPropertyAnimator =
+        animate().setDuration(dur).setInterpolator(ip).setStartDelay(delay)
+
+    fun AlertDialog.Builder.m3(): AlertDialog = create().also { d ->
+        d.show()
+        d.window?.setBackgroundDrawable(pill(cSurf, 28))
+        if (gb("an", true)) d.window?.decorView?.let { v ->
+            v.alpha = 0f; v.scaleX = 0.86f; v.scaleY = 0.86f; v.translationY = dp(28).toFloat()
+            v.fx(300, OvershootInterpolator(0.9f)).alpha(1f).scaleX(1f).scaleY(1f).translationY(0f).start()
+        }
     }
 
-    // ---------- свободное размещение на столе ----------
-    // хранится как "пакет|колонка|строка;пакет|колонка|строка"
+    fun gear() = txt("⚙", 22f).apply {
+        gravity = Gravity.CENTER; setTextColor(cOnSecC); background = ripple(withA(cSecC, 0xCC), 26)
+        setOnClickListener {
+            if (gb("an", true)) fx(420).rotationBy(180f).start()
+            settings()
+        }
+    }
+
+    // ---------- стол: клетки и экраны ----------
+    // хранится как "пакет|колонка|строка|экран;..."
     fun deskMap(): LinkedHashMap<String, IntArray> {
         val m = LinkedHashMap<String, IntArray>()
         (p.getString("deskp", "") ?: "").split(";").forEach { s ->
             val t = s.split("|")
-            if (t.size == 3) {
+            if (t.size >= 3) {
                 val c = t[1].toIntOrNull(); val r = t[2].toIntOrNull()
-                if (c != null && r != null) m[t[0]] = intArrayOf(c, r)
+                val pg = if (t.size >= 4) (t[3].toIntOrNull() ?: 0) else 0
+                if (c != null && r != null) m[t[0]] = intArrayOf(c, r, pg)
             }
         }
         return m
     }
 
     fun saveDesk(m: Map<String, IntArray>) = p.edit()
-        .putString("deskp", m.entries.joinToString(";") { it.key + "|" + it.value[0] + "|" + it.value[1] }).apply()
+        .putString("deskp", m.entries.joinToString(";") {
+            it.key + "|" + it.value[0] + "|" + it.value[1] + "|" + it.value[2]
+        }).apply()
 
     fun migrateDesk() {
         if (p.contains("deskp")) return
         val cols = gi("hc", 4)
         val m = LinkedHashMap<String, IntArray>()
-        lst("desk").forEachIndexed { i, pk -> m[pk] = intArrayOf(i % cols, i / cols) }
+        lst("desk").forEachIndexed { i, pk -> m[pk] = intArrayOf(i % cols, i / cols, 0) }
         saveDesk(m)
     }
 
     fun fixDesk(): LinkedHashMap<String, IntArray> {
-        val cols = gi("hc", 4); val rows = gi("hr", 5)
+        val cols = gi("hc", 4); val rows = gi("hr", 5); val n = np()
         val m = deskMap()
         var changed = false
         if (apps.isNotEmpty()) {
@@ -151,41 +181,56 @@ class MainActivity : Activity() {
         val used = HashSet<Int>()
         val pending = ArrayList<String>()
         for ((pk, pos) in m) {
-            val ok = pos[0] in 0 until cols && pos[1] in 0 until rows && used.add(pos[1] * cols + pos[0])
+            val ok = pos[2] in 0 until n && pos[0] in 0 until cols && pos[1] in 0 until rows &&
+                used.add(pos[2] * 10000 + pos[1] * 100 + pos[0])
             if (!ok) pending.add(pk)
         }
         for (pk in pending) {
-            var k = 0
-            while (k < cols * rows && k in used) k++
-            if (k >= cols * rows) m.remove(pk) else { m[pk] = intArrayOf(k % cols, k / cols); used.add(k) }
+            var placed = false
+            loop@ for (pg in 0 until n) {
+                for (k in 0 until cols * rows) {
+                    val key = pg * 10000 + (k / cols) * 100 + (k % cols)
+                    if (key !in used) {
+                        m[pk] = intArrayOf(k % cols, k / cols, pg); used.add(key); placed = true
+                        break@loop
+                    }
+                }
+            }
+            if (!placed) m.remove(pk)
             changed = true
         }
         if (changed) saveDesk(m)
         return m
     }
 
-    fun freeCell(m: Map<String, IntArray>): IntArray? {
-        val cols = gi("hc", 4); val rows = gi("hr", 5)
-        val used = m.values.map { it[1] * cols + it[0] }.toSet()
-        for (k in 0 until cols * rows) if (k !in used) return intArrayOf(k % cols, k / cols)
+    fun freeCell(m: Map<String, IntArray>, start: Int = curPage): IntArray? {
+        val cols = gi("hc", 4); val rows = gi("hr", 5); val n = np()
+        val used = m.values.map { it[2] * 10000 + it[1] * 100 + it[0] }.toSet()
+        for (j in 0 until n) {
+            val pg = (start + j) % n
+            for (k in 0 until cols * rows) {
+                val r = k / cols; val c = k % cols
+                if (pg * 10000 + r * 100 + c !in used) return intArrayOf(c, r, pg)
+            }
+        }
         return null
     }
 
-    fun deskPlace(pkg: String, c: Int, r: Int): Boolean {
+    fun deskPlace(pkg: String, c: Int, r: Int, pg: Int): Boolean {
         val m = fixDesk()
         val src = m[pkg]
-        val occ = m.entries.firstOrNull { it.key != pkg && it.value[0] == c && it.value[1] == r }
+        val occ = m.entries.firstOrNull { it.key != pkg && it.value[0] == c && it.value[1] == r && it.value[2] == pg }
         if (occ != null) {
-            if (src != null) m[occ.key] = intArrayOf(src[0], src[1])
+            if (src != null) m[occ.key] = intArrayOf(src[0], src[1], src[2])
             else {
-                val f = freeCell(m)
+                val f = freeCell(m, pg)
                 if (f == null) { Toast.makeText(this, "Стол заполнен", Toast.LENGTH_SHORT).show(); return false }
                 m[occ.key] = f
             }
-        } else if (src == null && freeCell(m) == null) {
+        } else if (src == null && freeCell(m, pg) == null) {
             Toast.makeText(this, "Стол заполнен", Toast.LENGTH_SHORT).show(); return false
         }
-        m[pkg] = intArrayOf(c, r)
+        m[pkg] = intArrayOf(c, r, pg)
         saveDesk(m)
         return true
     }
@@ -202,41 +247,184 @@ class MainActivity : Activity() {
     }
 
     fun cellAt(x: Float, y: Float): IntArray? {
-        val dl = deskLayer ?: return null
-        if (dl.width == 0 || !dl.isShown) return null
-        val a = IntArray(2); dl.getLocationInWindow(a)
+        val pg = pager ?: return null
+        if (pg.width == 0 || !pg.isShown) return null
+        val a = IntArray(2); pg.getLocationInWindow(a)
         val b = IntArray(2); root.getLocationInWindow(b)
         val lx = x - (a[0] - b[0]); val ly = y - (a[1] - b[1])
-        if (lx < 0 || ly < 0 || lx > dl.width || ly > dl.height) return null
+        if (lx < 0 || ly < 0 || lx > pg.width || ly > pg.height) return null
         val cols = gi("hc", 4); val rows = gi("hr", 5)
+        val ax = lx + pg.scrollX
+        val page = (ax / pg.width).toInt().coerceIn(0, np() - 1)
+        val localX = ax - page * pg.width
         return intArrayOf(
-            (lx / (dl.width / cols.toFloat())).toInt().coerceIn(0, cols - 1),
-            (ly / (dl.height / rows.toFloat())).toInt().coerceIn(0, rows - 1)
+            (localX / (pg.width / cols.toFloat())).toInt().coerceIn(0, cols - 1),
+            (ly / (pg.height / rows.toFloat())).toInt().coerceIn(0, rows - 1),
+            page
         )
     }
 
     fun hintCell(cell: IntArray?) {
         val h = cellHint ?: return
-        val dl = deskLayer
-        if (cell == null || dl == null || dl.width == 0) { h.visibility = View.GONE; lastHint = -1; return }
-        val key = cell[1] * 100 + cell[0]
+        val pg = pager
+        if (cell == null || pg == null || pg.width == 0) { h.visibility = View.GONE; lastHint = -1; return }
+        val key = cell[2] * 10000 + cell[1] * 100 + cell[0]
         if (key == lastHint && h.visibility == View.VISIBLE) return
         lastHint = key
-        val cw = dl.width / gi("hc", 4); val ch = dl.height / gi("hr", 5)
-        h.layoutParams = FrameLayout.LayoutParams(cw, ch).apply { leftMargin = cell[0] * cw; topMargin = cell[1] * ch }
+        val cw = pg.width / gi("hc", 4); val ch = pg.height / gi("hr", 5)
+        h.layoutParams = FrameLayout.LayoutParams(cw, ch).apply {
+            leftMargin = cell[2] * pg.width - pg.scrollX + cell[0] * cw; topMargin = cell[1] * ch
+        }
         h.visibility = View.VISIBLE
+        h.alpha = 0f; h.scaleX = 0.8f; h.scaleY = 0.8f
+        h.fx(160, OvershootInterpolator(1.5f)).alpha(1f).scaleX(1f).scaleY(1f).start()
     }
 
     fun layoutDesk() {
-        val dl = deskLayer ?: return
-        if (dl.width == 0) return
-        val cw = dl.width / gi("hc", 4); val ch = dl.height / gi("hr", 5)
+        val pg = pager ?: return
+        if (pg.width == 0) return
+        val cw = pg.width / gi("hc", 4); val ch = pg.height / gi("hr", 5)
         val m = deskMap()
-        for (i in 0 until dl.childCount) {
-            val v = dl.getChildAt(i)
-            val pk = v.tag as? String ?: continue
-            val pos = m[pk] ?: continue
-            v.layoutParams = FrameLayout.LayoutParams(cw, ch).apply { leftMargin = pos[0] * cw; topMargin = pos[1] * ch }
+        pages.forEach { layer ->
+            for (i in 0 until layer.childCount) {
+                val v = layer.getChildAt(i)
+                val pk = v.tag as? String ?: continue
+                val pos = m[pk] ?: continue
+                v.layoutParams = FrameLayout.LayoutParams(cw, ch).apply { leftMargin = pos[0] * cw; topMargin = pos[1] * ch }
+            }
+        }
+    }
+
+    inner class Pager(c: Context) : HorizontalScrollView(c) {
+        val strip = LinearLayout(c)
+        var flung = false
+        var snapAnim: ValueAnimator? = null
+
+        init {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isFillViewport = true
+            addView(strip, FrameLayout.LayoutParams(-2, -1))
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+            super.onSizeChanged(w, h, ow, oh)
+            post {
+                for (i in 0 until strip.childCount) strip.getChildAt(i).layoutParams = LinearLayout.LayoutParams(w, h)
+                post { scrollTo(curPage * w, 0); pageScrolled(scrollX); layoutDesk() }
+            }
+        }
+
+        override fun onScrollChanged(l: Int, t: Int, ol: Int, ot: Int) {
+            super.onScrollChanged(l, t, ol, ot)
+            pageScrolled(l)
+        }
+
+        override fun fling(velocityX: Int) {
+            flung = true
+            snap(if (velocityX > 500) curPage + 1 else if (velocityX < -500) curPage - 1 else nearest())
+        }
+
+        override fun onTouchEvent(ev: MotionEvent): Boolean {
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN) { flung = false; snapAnim?.cancel() }
+            val r = super.onTouchEvent(ev)
+            if ((ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) && !flung) snap(nearest())
+            return r
+        }
+
+        fun nearest(): Int = if (width == 0) 0 else Math.round(scrollX / width.toFloat())
+
+        fun snap(pg: Int) {
+            val t = pg.coerceIn(0, maxOf(0, strip.childCount - 1))
+            curPage = t
+            snapAnim?.cancel()
+            val to = t * width
+            if (!gb("an", true)) { scrollTo(to, 0); return }
+            snapAnim = ValueAnimator.ofInt(scrollX, to).apply {
+                duration = 340L; interpolator = DecelerateInterpolator(2f)
+                addUpdateListener { scrollTo(it.animatedValue as Int, 0) }
+                start()
+            }
+        }
+    }
+
+    fun pageScrolled(x: Int) {
+        val pg = pager ?: return
+        val w = pg.width
+        if (w == 0) return
+        val pos = x / w.toFloat()
+        pages.forEachIndexed { i, v ->
+            val o = Math.abs(i - pos).coerceAtMost(1f)
+            v.alpha = 1f - 0.5f * o; v.scaleX = 1f - 0.08f * o; v.scaleY = 1f - 0.08f * o
+        }
+        dotsBox?.let { d ->
+            for (i in 0 until d.childCount) {
+                val t = (1f - Math.abs(pos - i)).coerceIn(0f, 1f)
+                val v = d.getChildAt(i)
+                val lp = v.layoutParams
+                val nw = dp(6) + (dp(16) * t).toInt()
+                if (lp.width != nw) { lp.width = nw; v.layoutParams = lp }
+                (v.background as? GradientDrawable)?.setColor(withA(if (t > 0.5f) ac else cVar, (0x66 + 0x99 * t).toInt()))
+            }
+        }
+        val n = pages.size
+        wallView?.translationX = if (n > 1) -(pos / (n - 1) - 0.5f) * 0.1f * w else 0f
+    }
+
+    // ---------- анимации ----------
+    fun popView(c: View) {
+        if (!gb("an", true)) return
+        c.alpha = 0f; c.scaleX = 0.4f; c.scaleY = 0.4f
+        c.fx(380, OvershootInterpolator(2.2f)).alpha(1f).scaleX(1f).scaleY(1f).start()
+    }
+
+    fun popAll(d0: Long) {
+        if (!gb("an", true)) return
+        val cells = ArrayList<View>()
+        pager?.let { pg ->
+            pages.getOrNull(pg.nearest())?.let { l ->
+                for (j in 0 until l.childCount) if (l.getChildAt(j).tag is String) cells.add(l.getChildAt(j))
+            }
+        }
+        dockBox?.let { d -> for (j in 0 until d.childCount) cells.add(d.getChildAt(j)) }
+        var i = 0
+        cells.forEach { v ->
+            v.alpha = 0f; v.scaleX = 0.6f; v.scaleY = 0.6f
+            v.fx(340, OvershootInterpolator(1.4f), d0 + i * 28L).alpha(1f).scaleX(1f).scaleY(1f).start()
+            i++
+        }
+    }
+
+    fun intro() {
+        if (!gb("an", true)) return
+        clockBox?.apply { alpha = 0f; translationY = -dp(28).toFloat(); fx(420).alpha(1f).translationY(0f).start() }
+        dockBox?.apply {
+            alpha = 0f; translationY = dp(72).toFloat()
+            fx(460, OvershootInterpolator(0.9f), 120L).alpha(1f).translationY(0f).start()
+        }
+        dotsBox?.apply { alpha = 0f; fx(300, DecelerateInterpolator(2f), 300L).alpha(1f).start() }
+        popAll(80L)
+    }
+
+    fun returnAnim() {
+        if (!gb("an", true)) return
+        val v = if (prog > 0.5f) drw else home
+        v.alpha = 0f; v.scaleX = 1.1f; v.scaleY = 1.1f
+        v.fx(420).alpha(1f).scaleX(1f).scaleY(1f).start()
+        wallView?.let { w ->
+            w.scaleX = 1.3f; w.scaleY = 1.3f
+            w.fx(560).scaleX(1.12f + 0.06f * prog).scaleY(1.12f + 0.06f * prog).start()
+        }
+        if (prog <= 0.5f) popAll(80L)
+    }
+
+    fun staggerDrawer() {
+        val g = drawerGrid ?: return
+        val cols = gi("cols", 4)
+        for (i in 0 until g.childCount) {
+            val c = g.getChildAt(i)
+            c.alpha = 0f; c.translationY = dp(36).toFloat()
+            c.fx(320, DecelerateInterpolator(2f), 40L + (i / cols) * 35L).alpha(1f).translationY(0f).start()
         }
     }
 
@@ -257,13 +445,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         ovl?.let { root.removeView(it) }; ovl = null
-        if (launched) {
-            launched = false
-            if (gb("an", true)) root.apply {
-                alpha = 0f; scaleX = 1.06f; scaleY = 1.06f
-                animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(240).start()
-            }
-        }
+        if (launched) { launched = false; returnAnim() }
     }
 
     override fun onDestroy() {
@@ -277,6 +459,7 @@ class MainActivity : Activity() {
     override fun onNewIntent(i: Intent?) {
         super.onNewIntent(i)
         if (prog > 0f) go(false)
+        else pager?.snap(0)
     }
 
     override fun onBackPressed() {
@@ -334,12 +517,16 @@ class MainActivity : Activity() {
         home.alpha = 1 - v
         home.scaleX = 1 - 0.06f * v
         home.scaleY = 1 - 0.06f * v
+        wallView?.let { it.scaleX = 1.12f + 0.06f * v; it.scaleY = 1.12f + 0.06f * v }
     }
 
     fun go(open: Boolean) {
         anim?.cancel()
+        val an = gb("an", true)
+        if (open && prog < 0.05f && an) staggerDrawer()
+        if (!open && prog > 0.3f && an) popAll(120L)
         anim = ValueAnimator.ofFloat(prog, if (open) 1f else 0f).apply {
-            duration = if (gb("an", true)) 280L else 0L
+            duration = if (an) 300L else 0L
             interpolator = DecelerateInterpolator(1.6f)
             addUpdateListener { setP(it.animatedValue as Float) }
             start()
@@ -536,9 +723,14 @@ class MainActivity : Activity() {
         val fr = FrameLayout(this)
         val w = wallpaper()
         if (w == null && gi("wm", 0) != 1) fr.setBackgroundColor(gi("wc", cSurf))
-        if (w != null) fr.addView(ImageView(this).apply {
-            setImageDrawable(w); scaleType = ImageView.ScaleType.CENTER_CROP
-        }, FrameLayout.LayoutParams(-1, -1))
+        wallView = null
+        if (w != null) {
+            val iv = ImageView(this).apply {
+                setImageDrawable(w); scaleType = ImageView.ScaleType.CENTER_CROP; scaleX = 1.12f; scaleY = 1.12f
+            }
+            wallView = iv
+            fr.addView(iv, FrameLayout.LayoutParams(-1, -1))
+        }
         fr.addView(View(this).apply { setBackgroundColor(gi("bg", 0x33000000)) }, FrameLayout.LayoutParams(-1, -1))
         val h = LinearLayout(this); buildHome(h); home = h
         fr.addView(h, FrameLayout.LayoutParams(-1, -1))
@@ -576,6 +768,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL; setPadding(dp(10), 0, 0, 0)
             setOnLongClickListener { pickDesk(); true }
         }
+        clockBox = c
         if (gb("clock", true)) {
             c.addView(TextClock(this).apply {
                 format24Hour = "HH:mm"; format12Hour = "HH:mm"; textSize = gi("cs", 64).toFloat(); setTextColor(tc)
@@ -589,21 +782,37 @@ class MainActivity : Activity() {
         top.addView(c, LinearLayout.LayoutParams(0, -2, 1f))
         top.addView(gear(), LinearLayout.LayoutParams(dp(48), dp(48)))
         h.addView(top)
-        val dl = FrameLayout(this)
-        val hint = View(this).apply { background = pill(withA(ac, 0x44), 20); visibility = View.GONE }
-        dl.addView(hint, FrameLayout.LayoutParams(1, 1))
-        cellHint = hint; deskLayer = dl; lastHint = -1
-        dl.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, orr, ob ->
-            if (r - l != orr - ol || b - t != ob - ot) dl.post { layoutDesk() }
+
+        curPage = curPage.coerceIn(0, np() - 1)
+        val pg = Pager(this)
+        pager = pg
+        pages.clear()
+        for (i in 0 until np()) {
+            val layer = FrameLayout(this)
+            pages.add(layer)
+            pg.strip.addView(layer, LinearLayout.LayoutParams(1, 1))
         }
         val wrap = FrameLayout(this)
-        wrap.addView(dl, FrameLayout.LayoutParams(-1, -1))
+        wrap.addView(pg, FrameLayout.LayoutParams(-1, -1))
+        val hint = View(this).apply { background = pill(withA(ac, 0x44), 20); visibility = View.GONE }
+        wrap.addView(hint, FrameLayout.LayoutParams(1, 1))
+        cellHint = hint; lastHint = -1
         if (deskMap().isEmpty()) wrap.addView(
             txt("Пусто. Нажми сюда или перетащи приложения из списка", 15f).apply {
                 gravity = Gravity.CENTER; setOnClickListener { pickDesk() }
             }, FrameLayout.LayoutParams(-1, -1)
         )
         h.addView(wrap, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        val dots = LinearLayout(this).apply { gravity = Gravity.CENTER }
+        for (i in 0 until np()) dots.addView(
+            View(this).apply { background = pill(withA(cVar, 0x66), 3) },
+            LinearLayout.LayoutParams(dp(6), dp(6)).apply { setMargins(dp(3), 0, dp(3), 0) }
+        )
+        dotsBox = dots
+        if (np() < 2) dots.visibility = View.GONE
+        h.addView(dots, LinearLayout.LayoutParams(-1, dp(18)))
+
         if (gb("sdock", true)) {
             val d = LinearLayout(this).apply {
                 gravity = Gravity.CENTER; setPadding(dp(8), dp(8), dp(8), dp(8))
@@ -620,14 +829,18 @@ class MainActivity : Activity() {
     fun buildDrawer(d: LinearLayout) {
         d.orientation = LinearLayout.VERTICAL
         d.setPadding(dp(12), dp(32), dp(12), dp(8))
-        d.setBackgroundColor(gi("dbg", withA(cSurf, 0xE8)))
+        val rr = dp(28).toFloat()
+        d.background = GradientDrawable().apply {
+            setColor(gi("dbg", withA(cSurf, 0xE8)))
+            cornerRadii = floatArrayOf(rr, rr, rr, rr, 0f, 0f, 0f, 0f)
+        }
         d.addView(View(this).apply { background = pill(withA(cVar, 0x99), 2) },
             LinearLayout.LayoutParams(dp(36), dp(4)).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(12) })
         val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         searchBox = null
         if (gb("search", true)) {
             val e = EditText(this).apply {
-                hint = "Поиск приложений"; setHintTextColor(withA(cVar, 0xCC)); setTextColor(cOnSurf)
+                hint = "🔍  Поиск приложений"; setHintTextColor(withA(cVar, 0xCC)); setTextColor(cOnSurf)
                 setSingleLine(); textSize = 16f
                 background = pill(gi("pc", withA(cSurfC, 0xE6)), 26)
                 setPadding(dp(20), 0, dp(20), 0); setText(query); setSelection(query.length)
@@ -667,22 +880,28 @@ class MainActivity : Activity() {
 
     fun fill() {
         fillDrawer()
-        deskLayer?.let { dl ->
-            for (i in dl.childCount - 1 downTo 0) if (dl.getChildAt(i) !== cellHint) dl.removeViewAt(i)
-            for ((pk, _) in fixDesk()) {
+        val m = fixDesk()
+        pages.forEachIndexed { i, layer ->
+            layer.removeAllViews()
+            for ((pk, pos) in m) {
+                if (pos[2] != i) continue
                 val a = apps.find { it.pkg == pk } ?: continue
                 val c = newCell(true); c.tag = pk; bind(c, a, "desk")
-                dl.addView(c, FrameLayout.LayoutParams(1, 1))
+                layer.addView(c, FrameLayout.LayoutParams(1, 1))
+                if (pk == popPkg) popView(c)
             }
-            dl.post { layoutDesk() }
         }
+        pager?.post { layoutDesk() }
         dockBox?.apply {
             removeAllViews()
             lst("dockl").mapNotNull { pk -> apps.find { it.pkg == pk } }.forEach { a ->
                 val c = newCell(gb("dlbl", false)); bind(c, a, "dock")
                 addView(c, LinearLayout.LayoutParams(0, -2, 1f))
+                if (a.pkg == popPkg) popView(c)
             }
         }
+        popPkg = null
+        if (introPending && apps.isNotEmpty()) { introPending = false; root.post { intro() } }
     }
 
     fun newCell(showLabel: Boolean): View {
@@ -700,9 +919,9 @@ class MainActivity : Activity() {
             setOnTouchListener { v, e ->
                 if (gb("an", true)) {
                     if (e.actionMasked == MotionEvent.ACTION_DOWN)
-                        v.animate().scaleX(0.92f).scaleY(0.92f).setDuration(90).start()
+                        v.fx(90).scaleX(0.9f).scaleY(0.9f).start()
                     else if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL)
-                        v.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
+                        v.fx(260, OvershootInterpolator(3f)).scaleX(1f).scaleY(1f).start()
                 }
                 false
             }
@@ -730,16 +949,20 @@ class MainActivity : Activity() {
         })
         ovl = ov; launched = true
         val k = maxOf(dm.widthPixels / iv.width.toFloat(), dm.heightPixels / iv.height.toFloat()) * 1.15f
-        ov.animate().scaleX(k).scaleY(k)
+        ov.fx(320, DecelerateInterpolator(1.4f)).scaleX(k).scaleY(k)
             .translationX(dm.widthPixels / 2f - (loc[0] + iv.width / 2f))
             .translationY(dm.heightPixels / 2f - (loc[1] + iv.height / 2f))
-            .alpha(0f).setDuration(320).setInterpolator(DecelerateInterpolator(1.4f)).start()
+            .alpha(0f).start()
+        home.fx(300).alpha(0.4f).scaleX(0.94f).scaleY(0.94f).start()
         ui.postDelayed(Runnable {
             try {
                 startActivity(i, ActivityOptions.makeCustomAnimation(this, android.R.anim.fade_in, android.R.anim.fade_out).toBundle())
             } catch (e: Exception) { startActivity(i) }
         }, 90L)
-        ui.postDelayed(Runnable { if (ovl === ov) { root.removeView(ov); ovl = null } }, 900L)
+        ui.postDelayed(Runnable {
+            if (ovl === ov) { root.removeView(ov); ovl = null }
+            if (prog <= 0.5f) { home.alpha = 1f; home.scaleX = 1f; home.scaleY = 1f }
+        }, 900L)
     }
 
     // ---------- перетаскивание ----------
@@ -755,6 +978,8 @@ class MainActivity : Activity() {
         zones.forEachIndexed { i, z ->
             z.background = pill(if (i == hot) ac else cSecC, 24)
             z.setTextColor(if (i == hot) cOnAcc else cOnSecC)
+            val sc = if (i == hot) 1.08f else 1f
+            z.fx(140, OvershootInterpolator(2f)).scaleX(sc).scaleY(sc).start()
         }
     }
 
@@ -791,6 +1016,11 @@ class MainActivity : Activity() {
         return true
     }
 
+    fun stopEdge() {
+        edgeRun?.let { ui.removeCallbacks(it) }
+        edgeRun = null; edgeDir = 0
+    }
+
     fun onDrag(e: DragEvent): Boolean {
         val a = dragApp ?: return false
         when (e.action) {
@@ -798,18 +1028,47 @@ class MainActivity : Activity() {
             DragEvent.ACTION_DRAG_LOCATION -> {
                 if (!moved && Math.hypot((e.x - sx).toDouble(), (e.y - sy).toDouble()) > dp(24)) {
                     moved = true
-                    dragBar?.apply { alpha = 0f; visibility = View.VISIBLE; animate().alpha(1f).setDuration(150).start() }
+                    dragBar?.apply {
+                        visibility = View.VISIBLE; alpha = 0f; translationY = -dp(60).toFloat()
+                        fx(240, DecelerateInterpolator(1.6f)).alpha(1f).translationY(0f).start()
+                    }
                     if (dragSrc == "drawer" && prog > 0f) go(false)
                 }
                 if (moved) {
                     val z = zoneAt(e.x, e.y)
                     if (z != hot) { hot = z; paintZones() }
                     hintCell(if (z < 0 && !hit(dockBox, e.x, e.y)) cellAt(e.x, e.y) else null)
+                    val pgv = pager
+                    if (pgv != null && prog < 0.5f) {
+                        val dir = if (e.x < dp(36)) -1 else if (e.x > root.width - dp(36)) 1 else 0
+                        if (dir != edgeDir) {
+                            stopEdge()
+                            edgeDir = dir
+                            if (dir != 0) {
+                                val r = object : Runnable {
+                                    override fun run() {
+                                        val target = curPage + dir
+                                        if (target in 0 until np()) pgv.snap(target)
+                                        if (edgeDir == dir) ui.postDelayed(this, 750L)
+                                    }
+                                }
+                                edgeRun = r
+                                ui.postDelayed(r, 450L)
+                            }
+                        }
+                    }
                 }
             }
-            DragEvent.ACTION_DROP -> drop(a, e.x, e.y)
+            DragEvent.ACTION_DROP -> { stopEdge(); drop(a, e.x, e.y) }
             DragEvent.ACTION_DRAG_ENDED -> {
-                dragView?.alpha = 1f; dragBar?.visibility = View.GONE
+                stopEdge()
+                dragView?.alpha = 1f
+                val b = dragBar
+                if (b != null && b.visibility == View.VISIBLE) {
+                    b.fx(180).alpha(0f).translationY(-dp(40).toFloat()).withEndAction {
+                        if (dragApp == null) b.visibility = View.GONE
+                    }.start()
+                }
                 dragApp = null; dragView = null; hot = -1; paintZones(); hintCell(null)
             }
         }
@@ -832,11 +1091,13 @@ class MainActivity : Activity() {
         val db = dockBox
         if (db != null && hit(db, x, y)) {
             if (place("dockl", a.pkg, idxLinear(db, x), 5) && dragSrc == "desk") removeDesk(a.pkg)
+            popPkg = a.pkg
             rebuild(); return
         }
         val cell = cellAt(x, y)
-        if (cell != null && deskPlace(a.pkg, cell[0], cell[1])) {
+        if (cell != null && deskPlace(a.pkg, cell[0], cell[1], cell[2])) {
             if (dragSrc == "dock") put("dockl", lst("dockl") - a.pkg)
+            popPkg = a.pkg
             rebuild()
         }
     }
@@ -852,7 +1113,7 @@ class MainActivity : Activity() {
         if (pkg in l) l.remove(pkg)
         else if (l.size < max) l.add(pkg)
         else Toast.makeText(this, "Максимум $max", Toast.LENGTH_SHORT).show()
-        put(k, l); rebuild()
+        put(k, l); popPkg = pkg; rebuild()
     }
 
     fun menu(a: App) {
@@ -869,7 +1130,7 @@ class MainActivity : Activity() {
                 2 -> rename(a)
                 3 -> hideApp(a)
                 4 -> toggle("dockl", a.pkg, 5)
-                5 -> { if (onDesk) removeDesk(a.pkg) else addDeskAuto(a.pkg); rebuild() }
+                5 -> { if (onDesk) removeDesk(a.pkg) else { addDeskAuto(a.pkg); popPkg = a.pkg }; rebuild() }
             }
         }.m3()
     }
@@ -907,11 +1168,21 @@ class MainActivity : Activity() {
 
     fun LinearLayout.hdr(t: String) = addView(TextView(context).apply {
         text = t; setTextColor(ac); textSize = 14f; typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-        setPadding(0, dp(22), 0, dp(4))
+        setPadding(dp(8), dp(22), 0, dp(4))
     })
 
+    fun LinearLayout.card(t: String): LinearLayout {
+        hdr(t)
+        val c = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL; background = pill(cSurfC, 24)
+            setPadding(dp(16), dp(6), dp(16), dp(14))
+        }
+        addView(c, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        return c
+    }
+
     fun LinearLayout.btn(t: String, a: () -> Unit) = addView(Button(context).apply {
-        text = t; setAllCaps(false); setTextColor(cOnSecC); background = pill(cSecC, 20)
+        text = t; setAllCaps(false); setTextColor(cOnSecC); background = ripple(cSecC, 20)
         stateListAnimator = null; setOnClickListener { a() }
     }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
 
@@ -958,50 +1229,57 @@ class MainActivity : Activity() {
     }
 
     fun settings() {
-        val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(22), dp(10), dp(22), dp(10)) }
+        val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(10), dp(18), dp(10)) }
         val names = arrayOf("Мои обои (встроенные)", "Системные обои", "Фото из галереи", "Один цвет")
-        l.hdr("ОБОИ")
-        l.btn("Источник обоев") {
+        var c = l.card("ОБОИ")
+        c.btn("Источник обоев") {
             AlertDialog.Builder(this, DLG).setItems(names) { _, w -> p.edit().putInt("wm", w).apply(); change(false) }.m3()
         }
-        l.btn("Выбрать фото из галереи") {
+        c.btn("Выбрать фото из галереи") {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).setType("image/*").addCategory(Intent.CATEGORY_OPENABLE), 7)
         }
-        l.color("Затемнение обоев", "bg", 0x33000000)
-        l.color("Цвет фона (режим «цвет»)", "wc", cSurf)
-        l.hdr("ГЛАВНЫЙ СТОЛ")
-        l.btn("Выбрать приложения для стола") { pickDesk() }
-        l.sw("Часы и дата", "clock", true)
-        l.seek("Размер часов", "cs", 24, 96, 64)
-        l.seek("Колонок на столе", "hc", 3, 7, 4)
-        l.seek("Строк на столе", "hr", 3, 8, 5)
-        l.sw("Док", "sdock", true)
-        l.sw("Подписи в доке", "dlbl", false)
-        l.seek("Скругление дока", "dockr", 0, 50, 32)
-        l.color("Цвет дока", "dockc", withA(cSurfC, 0xCC))
-        l.hdr("СПИСОК ПРИЛОЖЕНИЙ")
-        l.seek("Колонок в списке", "cols", 3, 7, 4)
-        l.color("Фон списка", "dbg", withA(cSurf, 0xE8))
-        l.sw("Поиск", "search", true)
-        l.color("Цвет поиска", "pc", withA(cSurfC, 0xE6))
-        l.sw("Сортировка Я→А", "rev", false)
-        l.hdr("ИКОНКИ")
-        l.sw("Оригинальные иконки (без темы системы)", "oi", true, 1)
-        l.sw("Темизированные иконки Material You (Android 13+)", "mono", false, 2)
-        l.seek("Размер иконок", "is", 32, 96, 60, true)
-        l.seek("Скругление иконок, %", "rad", 0, 50, 24, true)
-        l.seek("Отступ между рядами", "gap", 0, 40, 6)
-        l.hdr("ТЕКСТ")
-        l.sw("Подписи под иконками", "lbl", true)
-        l.seek("Размер подписей", "ts", 8, 20, 12)
-        l.color("Цвет текста", "tc", Color.WHITE)
-        l.hdr("ПРОЧЕЕ")
-        l.sw("Анимации", "an", true)
-        l.color("Акцентный цвет", "ac", cAcc)
-        l.btn("Показать скрытые приложения") { p.edit().remove("hidden").apply(); reload() }
-        l.btn("Сбросить всё") { p.edit().clear().apply(); wallMode = -1; migrateDesk(); reload() }
+        c.color("Затемнение обоев", "bg", 0x33000000)
+        c.color("Цвет фона (режим «цвет»)", "wc", cSurf)
+        c = l.card("ГЛАВНЫЙ СТОЛ")
+        c.btn("Выбрать приложения для стола") { pickDesk() }
+        c.seek("Экранов стола", "np", 1, 6, 2)
+        c.seek("Колонок на столе", "hc", 3, 7, 4)
+        c.seek("Строк на столе", "hr", 3, 8, 5)
+        c.sw("Часы и дата", "clock", true)
+        c.seek("Размер часов", "cs", 24, 96, 64)
+        c = l.card("ДОК")
+        c.sw("Показывать док", "sdock", true)
+        c.sw("Подписи в доке", "dlbl", false)
+        c.seek("Скругление дока", "dockr", 0, 50, 32)
+        c.color("Цвет дока", "dockc", withA(cSurfC, 0xCC))
+        c = l.card("СПИСОК ПРИЛОЖЕНИЙ")
+        c.seek("Колонок в списке", "cols", 3, 7, 4)
+        c.color("Фон списка", "dbg", withA(cSurf, 0xE8))
+        c.sw("Поиск", "search", true)
+        c.color("Цвет поиска", "pc", withA(cSurfC, 0xE6))
+        c.sw("Сортировка Я→А", "rev", false)
+        c = l.card("ИКОНКИ")
+        c.sw("Оригинальные иконки (без темы системы)", "oi", true, 1)
+        c.sw("Темизированные иконки Material You (Android 13+)", "mono", false, 2)
+        c.seek("Размер иконок", "is", 32, 96, 60, true)
+        c.seek("Скругление иконок, %", "rad", 0, 50, 24, true)
+        c.seek("Отступ между рядами", "gap", 0, 40, 6)
+        c = l.card("ТЕКСТ")
+        c.sw("Подписи под иконками", "lbl", true)
+        c.seek("Размер подписей", "ts", 8, 20, 12)
+        c.color("Цвет текста", "tc", Color.WHITE)
+        c = l.card("ПРОЧЕЕ")
+        c.sw("Анимации", "an", true)
+        c.color("Акцентный цвет", "ac", cAcc)
+        c.btn("Показать скрытые приложения") { p.edit().remove("hidden").apply(); reload() }
+        c.btn("Сбросить всё") { p.edit().clear().apply(); wallMode = -1; migrateDesk(); reload() }
         AlertDialog.Builder(this, DLG).setTitle("Настройки")
             .setView(ScrollView(this).apply { addView(l) })
             .setPositiveButton("Готово", null).m3()
+        if (gb("an", true)) for (i in 0 until minOf(l.childCount, 12)) {
+            val v = l.getChildAt(i)
+            v.alpha = 0f; v.translationY = dp(30).toFloat()
+            v.fx(360, DecelerateInterpolator(2f), 60L + i * 40L).alpha(1f).translationY(0f).start()
+        }
     }
 }
