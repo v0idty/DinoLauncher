@@ -614,6 +614,12 @@ class MainActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         p = getSharedPreferences("cfg", 0)
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        if (Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = false
+        if (Build.VERSION.SDK_INT >= 30) window.setDecorFitsSystemWindows(false)
+        else window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
         migrateDesk()
         val f = IntentFilter().apply {
             addAction(Intent.ACTION_PACKAGE_ADDED); addAction(Intent.ACTION_PACKAGE_REMOVED)
@@ -806,7 +812,7 @@ class MainActivity : Activity() {
         return out
     }
 
-    fun cacheKey() = "${dp(gi("is", 60))}|${gi("rad", 24)}|${gb("mono", false)}|${gb("oi", true)}|$cSecC|$cOnSecC"
+    fun cacheKey() = "${dp(gi("is", 60))}|${gi("rad", 24)}|${gi("shape", 0)}|${gb("mono", false)}|${gb("oi", true)}|$cSecC|$cOnSecC"
 
     fun sig(l: List<App>) = l.sortedBy { it.pkg }.joinToString("|") { it.pkg + "=" + it.orig }
 
@@ -855,7 +861,7 @@ class MainActivity : Activity() {
             val latch = CountDownLatch(list.size)
             list.forEachIndexed { i, a ->
                 workers.execute {
-                    try { val d = icon(ris[i]); a.raw = d; a.bmp = bake(d, s, r) }
+                    try { val d = icon(ris[i]); a.raw = d; a.bmp = Shapes.shape(bake(d, s, r), gi("shape", 0), a.pkg) }
                     catch (e: Exception) {}
                     finally { latch.countDown() }
                 }
@@ -878,7 +884,7 @@ class MainActivity : Activity() {
             val latch = CountDownLatch(cur.size)
             cur.forEach { a ->
                 workers.execute {
-                    try { a.raw?.let { a.bmp = bake(it, s, r) } }
+                    try { a.raw?.let { a.bmp = Shapes.shape(bake(it, s, r), gi("shape", 0), a.pkg) } }
                     catch (e: Exception) {}
                     finally { latch.countDown() }
                 }
@@ -958,6 +964,11 @@ class MainActivity : Activity() {
         fr.setOnDragListener { _, e -> onDrag(e) }
         lockView?.let { lv ->
             if (lockOn) { (lv.parent as? ViewGroup)?.removeView(lv); fr.addView(lv, FrameLayout.LayoutParams(-1, -1)) }
+        }
+        fr.setOnApplyWindowInsetsListener { _, ins ->
+            home.setPadding(dp(12), ins.stableInsetTop + dp(8), dp(12), ins.stableInsetBottom + dp(8))
+            drw.setPadding(dp(12), ins.stableInsetTop + dp(12), dp(12), ins.stableInsetBottom + dp(8))
+            ins
         }
         root = fr
         setContentView(fr)
@@ -1483,6 +1494,11 @@ class MainActivity : Activity() {
         c.sw("Темизированные иконки Material You (Android 13+)", "mono", false, 2)
         c.seek("Размер иконок", "is", 32, 96, 60, true)
         c.seek("Скругление иконок, %", "rad", 0, 50, 24, true)
+        c.btn("Форма иконок: " + Shapes.names[gi("shape", 0)]) {
+            AlertDialog.Builder(this, DLG).setItems(Shapes.names) { _, w ->
+                p.edit().putInt("shape", w).apply(); change(true)
+            }.m3()
+        }
         c.seek("Отступ между рядами", "gap", 0, 40, 6)
         c = l.card("ТЕКСТ")
         c.sw("Подписи под иконками", "lbl", true)
